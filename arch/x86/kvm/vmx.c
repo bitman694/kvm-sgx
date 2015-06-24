@@ -108,6 +108,9 @@ static u64 __read_mostly host_xss;
 static bool __read_mostly enable_pml = 1;
 module_param_named(pml, enable_pml, bool, S_IRUGO);
 
+static bool __read_mostly enable_sgx = 1;
+module_param_named(sgx, enable_sgx, bool, S_IRUGO);
+
 #define KVM_VMX_TSC_MULTIPLIER_MAX     0xffffffffffffffffULL
 
 /* Guest_tsc -> host_tsc conversion requires 64-bit division.  */
@@ -1121,6 +1124,12 @@ static inline bool cpu_has_vmx_virtual_intr_delivery(void)
 {
 	return vmcs_config.cpu_based_2nd_exec_ctrl &
 		SECONDARY_EXEC_VIRTUAL_INTR_DELIVERY;
+}
+
+static inline bool cpu_has_vmx_encls_vmexit(void)
+{
+	return vmcs_config.cpu_based_2nd_exec_ctrl &
+		SECONDARY_EXEC_ENCLS_EXITING;
 }
 
 /*
@@ -3585,7 +3594,8 @@ static __init int setup_vmcs_config(struct vmcs_config *vmcs_conf)
 			SECONDARY_EXEC_SHADOW_VMCS |
 			SECONDARY_EXEC_XSAVES |
 			SECONDARY_EXEC_ENABLE_PML |
-			SECONDARY_EXEC_TSC_SCALING;
+			SECONDARY_EXEC_TSC_SCALING |
+			SECONDARY_EXEC_ENCLS_EXITING;
 		if (adjust_vmx_controls(min2, opt2,
 					MSR_IA32_VMX_PROCBASED_CTLS2,
 					&_cpu_based_2nd_exec_control) < 0)
@@ -5160,6 +5170,13 @@ static u32 vmx_secondary_exec_control(struct vcpu_vmx *vmx)
 	if (!enable_pml)
 		exec_control &= ~SECONDARY_EXEC_ENABLE_PML;
 
+	/*
+	 * ENCLS VMEXIT is controlled in vmx_cpuid_update. This function is
+	 * called in many places. We don't want ENCLS VMEXIT get enabled
+	 * surprisingly.
+	 */
+	exec_control &= ~SECONDARY_EXEC_ENCLS_EXITING;
+
 	return exec_control;
 }
 
@@ -6654,6 +6671,9 @@ static __init int hardware_setup(void)
 	kvm_set_posted_intr_wakeup_handler(wakeup_handler);
 
 	kvm_mce_cap_supported |= MCG_LMCE_P;
+
+	if (!cpu_has_vmx_encls_vmexit())
+		enable_sgx = 0;
 
 	return alloc_kvm_area();
 
