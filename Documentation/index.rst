@@ -59,6 +59,7 @@ needed).
    security/index
    sound/index
    crypto/index
+   x86/index
 
 Korean translations
 -------------------
