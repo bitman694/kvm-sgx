@@ -3329,6 +3329,20 @@ static int vmx_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 		vmx->msr_ia32_feature_control = data;
 		if (msr_info->host_initiated && data == 0)
 			vmx_leave_nested(vcpu);
+		/*
+		 * If guest's FEATURE_CONTROL_SGX_ENABLE is disabled, shall
+		 * we also clear vcpu's SGX CPUID? SDM (chapter 37.7.7.1)
+		 * says FEATURE_CONTROL_SGX_ENABLE bit doesn't reflect SGX
+		 * CPUID but in reality seems if FEATURE_CONTROL_SGX_ENABLE
+		 * is disabled, SGX CPUID will reports (at least) invalid EPC.
+		 * But looks we cannot just simply clear vcpu's SGX CPUID,
+		 * as Qemu may write IA32_FEATURE_CONTROL *before* or *after*
+		 * KVM_SET_CPUID2. If KVM_SET_CPUID2 is called first, and we
+		 * clear vcpu's SGX CPUID here, we will not be able to enable
+		 * SGX again as SGX CPUID info has already lost. Therefore do
+		 * nothing here. We assume guest will always check whether
+		 * SGX has been enabled in BIOS before using SGX.
+		 */
 		break;
 	case MSR_IA32_VMX_BASIC ... MSR_IA32_VMX_VMFUNC:
 		if (!msr_info->host_initiated)
@@ -9593,6 +9607,20 @@ static int vmx_cpuid_update(struct kvm_vcpu *vcpu)
 	r = vmx_cpuid_update_sgx(vcpu);
 	if (r)
 		return r;
+
+	if (guest_cpuid_has_sgx(vcpu)) {
+		/*
+		 * If CPUID.0x7.0:EBX.SGX = 1, SGX can be opt-in{out} in BIOS
+		 * via IA32_FEATURE_CONTROL bit 18. If CPUID.0x7.0:ECX[bit30]
+		 * = 1, IA32_FEATURE_CONTROL bit 17 is valid to enable runtime
+		 * SGX Launch Control.
+		 */
+		to_vmx(vcpu)->msr_ia32_feature_control_valid_bits |=
+			FEATURE_CONTROL_SGX_ENABLE;
+		if (guest_cpuid_has_sgx_launch_control(vcpu))
+			to_vmx(vcpu)->msr_ia32_feature_control_valid_bits |=
+				FEATURE_CONTROL_SGX_LAUNCH_CONTROL_ENABLE;
+	}
 
 	return 0;
 }
