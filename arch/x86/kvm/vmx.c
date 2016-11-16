@@ -52,6 +52,8 @@
 #include "trace.h"
 #include "pmu.h"
 
+#include "sgx.h"
+
 #define __ex(x) __kvm_handle_fault_on_reboot(x)
 #define __ex_clear(x, reg) \
 	____kvm_handle_fault_on_reboot(x, "xor " reg " , " reg)
@@ -11657,6 +11659,11 @@ static int __init vmx_init(void)
 	if (r)
 		return r;
 
+	if (enable_sgx) {
+		if (sgx_init())
+			enable_sgx = 0;
+	}
+
 #ifdef CONFIG_KEXEC_CORE
 	rcu_assign_pointer(crash_vmclear_loaded_vmcss,
 			   crash_vmclear_local_loaded_vmcss);
@@ -11671,6 +11678,9 @@ static void __exit vmx_exit(void)
 	RCU_INIT_POINTER(crash_vmclear_loaded_vmcss, NULL);
 	synchronize_rcu();
 #endif
+
+	if (enable_sgx)
+		sgx_destroy();
 
 	kvm_exit();
 }
