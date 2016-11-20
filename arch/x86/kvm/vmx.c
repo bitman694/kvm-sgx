@@ -9493,10 +9493,75 @@ static void vmx_cpuid_update(struct kvm_vcpu *vcpu)
 		nested_vmx_cr_fixed1_bits_update(vcpu);
 }
 
-static void vmx_set_supported_cpuid(u32 func, struct kvm_cpuid_entry2 *entry)
+static int vmx_set_supported_cpuid(u32 func, u32 index,
+		struct kvm_cpuid_entry2 *entry, int *nent, int maxnent)
 {
-	if (func == 1 && nested)
-		entry->ecx |= bit(X86_FEATURE_VMX);
+	int r = -E2BIG;
+
+	switch (func) {
+	case 0x1:
+		if (nested)
+			entry->ecx |= bit(X86_FEATURE_VMX);
+		break;
+	case 0x7:
+		if (index == 0 && enable_sgx) {
+			entry->ebx |= bit(X86_FEATURE_SGX);
+			if (boot_cpu_has(X86_FEATURE_SGX_LAUNCH_CONTROL))
+				entry->ecx |=
+					bit(X86_FEATURE_SGX_LAUNCH_CONTROL);
+		}
+		break;
+	case 0x12: {
+		WARN_ON(index != 0);
+
+		if (enable_sgx) {
+			if (*nent >= maxnent)
+				goto out;
+
+			/* do_cpuid_1_ent has already been called for index 0 */
+			entry->flags |= KVM_CPUID_FLAG_SIGNIFCANT_INDEX;
+
+			/* Index 1: SECS.ATTRIBUTE */
+			do_cpuid_1_ent(++entry, 0x12, 0x1);
+			entry->flags |= KVM_CPUID_FLAG_SIGNIFCANT_INDEX;
+			++*nent;
+
+			if (*nent >= maxnent)
+				goto out;
+
+			/*
+			 * Index 2: EPC section
+			 *
+			 * Note: We only report one EPC section as userspace
+			 * doesn't need to know physical EPC info. In fact,
+			 * KVM_SET_CPUID2 should contain guest's virtual EPC
+			 * base & size, in which case one virtual EPC section
+			 * is obviously enough for guest.
+			 */
+			do_cpuid_1_ent(++entry, 0x12, 0x2);
+			entry->flags |= KVM_CPUID_FLAG_SIGNIFCANT_INDEX;
+			/*
+			 * Don't report physical EPC info as userspace doesn't
+			 * need to know.
+			 */
+			entry->eax &= 0xf;
+			entry->ebx = 0;
+			entry->ecx &= 0xf;
+			entry->edx = 0;
+			++*nent;
+		}
+		else
+			entry->eax = entry->ebx = entry->ecx = entry->edx = 0;
+
+		break;
+	}
+	default:
+		break;
+	}
+
+	r = 0;
+out:
+	return r;
 }
 
 static void nested_ept_inject_page_fault(struct kvm_vcpu *vcpu,

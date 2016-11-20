@@ -4988,7 +4988,8 @@ static void svm_cpuid_update(struct kvm_vcpu *vcpu)
 		entry->ecx &= ~bit(X86_FEATURE_X2APIC);
 }
 
-static void svm_set_supported_cpuid(u32 func, struct kvm_cpuid_entry2 *entry)
+static int svm_set_supported_cpuid(u32 func, u32 index,
+		struct kvm_cpuid_entry2 *entry, int *nent, int maxnent)
 {
 	switch (func) {
 	case 0x1:
@@ -5017,6 +5018,8 @@ static void svm_set_supported_cpuid(u32 func, struct kvm_cpuid_entry2 *entry)
 
 		break;
 	}
+
+	return 0;
 }
 
 static int svm_get_lpage_level(void)
