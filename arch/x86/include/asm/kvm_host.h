@@ -40,7 +40,7 @@
 #define KVM_MAX_VCPU_ID 1023
 #define KVM_USER_MEM_SLOTS 509
 /* memory slots that are not exposed to userspace */
-#define KVM_PRIVATE_MEM_SLOTS 3
+#define KVM_PRIVATE_MEM_SLOTS 4
 #define KVM_MEM_SLOTS_NUM (KVM_USER_MEM_SLOTS + KVM_PRIVATE_MEM_SLOTS)
 
 #define KVM_PIO_PAGE_OFFSET 1
@@ -817,6 +817,8 @@ struct kvm_arch {
 
 	bool x2apic_format;
 	bool x2apic_broadcast_quirk_disabled;
+
+	void *priv;	/* x86 vendor specific data */
 };
 
 struct kvm_vm_stat {
