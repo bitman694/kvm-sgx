@@ -155,6 +155,26 @@ static inline bool guest_cpuid_has_rdtscp(struct kvm_vcpu *vcpu)
 }
 
 /*
+ * Only checks CPUID.0x7.0x0:EBX.SGX. SDM says if this bit is 1, logical
+ * processor supports SGX CPUID 0x12.
+ */
+static inline bool guest_cpuid_has_sgx(struct kvm_vcpu *vcpu)
+{
+	struct kvm_cpuid_entry2 *best;
+
+	best = kvm_find_cpuid_entry(vcpu, 0x7, 0);
+	return best && (best->ebx & bit(X86_FEATURE_SGX));
+}
+
+static inline bool guest_cpuid_has_sgx_launch_control(struct kvm_vcpu *vcpu)
+{
+	struct kvm_cpuid_entry2 *best;
+
+	best = kvm_find_cpuid_entry(vcpu, 0x7, 0);
+	return best && (best->ecx & bit(X86_FEATURE_SGX_LAUNCH_CONTROL));
+}
+
+/*
  * NRIPS is provided through cpuidfn 0x8000000a.edx bit 3
  */
 #define BIT_NRIPS	3

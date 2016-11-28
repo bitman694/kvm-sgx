@@ -9447,11 +9447,109 @@ static void nested_vmx_cr_fixed1_bits_update(struct kvm_vcpu *vcpu)
 #undef cr4_fixed1_update
 }
 
-static void vmx_cpuid_update(struct kvm_vcpu *vcpu)
+/* This should be called after vcpu's SGX CPUID has been properly setup */
+static void vmx_cpuid_get_sgx_cpuinfo(struct kvm_vcpu *vcpu, struct
+		sgx_cpuinfo *sgxinfo)
+{
+	struct kvm_cpuid_entry2 *best;
+	u64 base, size;
+
+	BUG_ON(!sgxinfo);
+
+	/* See comments in detect_sgx... */
+	memset(sgxinfo, 0, sizeof(struct sgx_cpuinfo));
+
+	best = kvm_find_cpuid_entry(vcpu, 0x12, 0);
+	if (!best)
+		goto not_supported;
+	if (!(best->eax & SGX_CAP_SGX1))
+		goto not_supported;
+
+	sgxinfo->cap = best->eax;
+	sgxinfo->miscselect = best->ebx;
+	sgxinfo->max_enclave_size32 = best->edx & 0xff;
+	sgxinfo->max_enclave_size64 = (best->edx & 0xff00) >> 8;
+
+	best = kvm_find_cpuid_entry(vcpu, 0x12, 1);
+	if (!best)
+		goto not_supported;
+
+	sgxinfo->secs_attr_bitmask[0] = best->eax;
+	sgxinfo->secs_attr_bitmask[1] = best->ebx;
+	sgxinfo->secs_attr_bitmask[2] = best->ecx;
+	sgxinfo->secs_attr_bitmask[3] = best->edx;
+
+	best = kvm_find_cpuid_entry(vcpu, 0x12, 2);
+	if (!(best->eax & 0x1) || !(best->ecx & 0x1))
+		goto not_supported;
+
+	base = (((u64)(best->ebx & 0xfffff)) << 32) | (best->eax & 0xfffff000);
+	size = (((u64)(best->edx & 0xfffff)) << 32) | (best->ecx & 0xfffff000);
+	if (!base || !size)
+		goto not_supported;
+
+	sgxinfo->epc_base = base;
+	sgxinfo->epc_size = size;
+
+	return;
+
+not_supported:
+	memset(sgxinfo, 0, sizeof(struct sgx_cpuinfo));
+}
+
+static int vmx_cpuid_update_sgx(struct kvm_vcpu *vcpu)
+{
+	struct kvm_cpuid_entry2 *best;
+	struct sgx_cpuinfo si;
+	int r;
+
+	/* Nothing to check if SGX is not enabled for guest */
+	if (!guest_cpuid_has_sgx(vcpu))
+		return 0;
+
+	/*
+	 * Update CPUID.0x12.0x1 according to vcpu->arch.guest_supported_xcr0,
+	 * which is calculated in kvm_update_cpuid. This is the reason we
+	 * change the order of kvm_x86_ops->cpuid_update and kvm_update_cpuid.
+	 */
+	best = kvm_find_cpuid_entry(vcpu, 0x12, 0x1);
+	if (!best)
+		return -EFAULT;
+	best->ecx &= (unsigned int)(vcpu->arch.guest_supported_xcr0 & 0xffffffff);
+	best->ecx |= 0x3;
+	best->edx &= (unsigned int)(vcpu->arch.guest_supported_xcr0 >> 32);
+
+	/*
+	 * Make sure all SGX CPUIDs are properly set in KVM_SET_CPUID2 from
+	 * userspace. vmx_cpuid_get_sgx_cpuinfo will report invalid SGX if
+	 * any SGX CPUID is not properly setup in KVM_SET_CPUID2.
+	 */
+	vmx_cpuid_get_sgx_cpuinfo(vcpu, &si);
+	if (!(si.cap & SGX_CAP_SGX1))
+		return -EFAULT;
+
+	/*
+	 * Initialize guest's SGX staff here. To avoid a new IOCTL to allow
+	 * userspace to pass guest's (virtual) EPC base and size to, KVM gets
+	 * such info from KVM_SET_CPUID2. Initializing guest's SGX here also
+	 * provides a way for KVM to check whether userspace did everything
+	 * right about SGX CPUID (ex, inconsistent SGX CPUID between vcpus
+	 * is passed to KVM). In case of any error, we return error to reflect
+	 * userspace did something wrong about CPUID.
+	 */
+	r = kvm_init_sgx(vcpu->kvm, &si);
+	if (r)
+		return r;
+
+	return 0;
+}
+
+static int vmx_cpuid_update(struct kvm_vcpu *vcpu)
 {
 	struct kvm_cpuid_entry2 *best;
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
 	u32 secondary_exec_ctl = vmx_secondary_exec_control(vmx);
+	int r = 0;
 
 	if (vmx_rdtscp_supported()) {
 		bool rdtscp_enabled = guest_cpuid_has_rdtscp(vcpu);
@@ -9491,6 +9589,12 @@ static void vmx_cpuid_update(struct kvm_vcpu *vcpu)
 
 	if (nested_vmx_allowed(vcpu))
 		nested_vmx_cr_fixed1_bits_update(vcpu);
+
+	r = vmx_cpuid_update_sgx(vcpu);
+	if (r)
+		return r;
+
+	return 0;
 }
 
 static int vmx_set_supported_cpuid(u32 func, u32 index,
@@ -11589,6 +11693,11 @@ static void vmx_setup_mce(struct kvm_vcpu *vcpu)
 			~FEATURE_CONTROL_LMCE;
 }
 
+static void vmx_vm_destroy(struct kvm *kvm)
+{
+	kvm_destroy_sgx(kvm);
+}
+
 static struct kvm_x86_ops vmx_x86_ops __ro_after_init = {
 	.cpu_has_kvm_support = cpu_has_kvm_support,
 	.disabled_by_bios = vmx_disabled_by_bios,
@@ -11599,6 +11708,8 @@ static struct kvm_x86_ops vmx_x86_ops __ro_after_init = {
 	.hardware_disable = hardware_disable,
 	.cpu_has_accelerated_tpr = report_flexpriority,
 	.cpu_has_high_real_mode_segbase = vmx_has_high_real_mode_segbase,
+
+	.vm_destroy = vmx_vm_destroy,
 
 	.vcpu_create = vmx_create_vcpu,
 	.vcpu_free = vmx_free_vcpu,
