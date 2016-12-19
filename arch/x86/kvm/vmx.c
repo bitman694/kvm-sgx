@@ -656,6 +656,9 @@ struct vcpu_vmx {
 	 */
 	u64 msr_ia32_feature_control;
 	u64 msr_ia32_feature_control_valid_bits;
+
+	/* SGX Launch Control public key hash */
+	u64 msr_ia32_sgxlepubkeyhash[4];
 };
 
 enum segment_cache_field {
@@ -2244,6 +2247,70 @@ static void decache_tsc_multiplier(struct vcpu_vmx *vmx)
 	vmcs_write64(TSC_MULTIPLIER, vmx->current_tsc_ratio);
 }
 
+static bool cpu_sgx_lepubkeyhash_writable(void)
+{
+	u64 val, sgx_lc_enabled_mask = (FEATURE_CONTROL_LOCKED |
+			FEATURE_CONTROL_SGX_LAUNCH_CONTROL_ENABLE);
+
+	rdmsrl(MSR_IA32_FEATURE_CONTROL, val);
+
+	return ((val & sgx_lc_enabled_mask) == sgx_lc_enabled_mask);
+}
+
+static bool vmx_sgx_lc_disabled_in_bios(struct kvm_vcpu *vcpu)
+{
+	return (to_vmx(vcpu)->msr_ia32_feature_control & FEATURE_CONTROL_LOCKED)
+		&& (!(to_vmx(vcpu)->msr_ia32_feature_control &
+				FEATURE_CONTROL_SGX_LAUNCH_CONTROL_ENABLE));
+}
+
+#define	SGX_INTEL_DEFAULT_LEPUBKEYHASH0		0xa6053e051270b7ac
+#define	SGX_INTEL_DEFAULT_LEPUBKEYHASH1	        0x6cfbe8ba8b3b413d
+#define	SGX_INTEL_DEFAULT_LEPUBKEYHASH2		0xc4916d99f2b3735d
+#define	SGX_INTEL_DEFAULT_LEPUBKEYHASH3		0xd4f8c05909f9bb3b
+
+static void vmx_sgx_init_lepubkeyhash(struct kvm_vcpu *vcpu)
+{
+	u64 h0, h1, h2, h3;
+
+	/*
+	 * If runtime launch control is enabled (IA32_SGXLEPUBKEYHASHn is
+	 * writable), we set guest's default value to be Intel's default
+	 * hash (which is fixed value and can be hard-coded). Otherwise,
+	 * guest can only use machine's IA32_SGXLEPUBKEYHASHn so set guest's
+	 * default to that.
+	 */
+	if (cpu_sgx_lepubkeyhash_writable()) {
+		h0 = SGX_INTEL_DEFAULT_LEPUBKEYHASH0;
+		h1 = SGX_INTEL_DEFAULT_LEPUBKEYHASH1;
+		h2 = SGX_INTEL_DEFAULT_LEPUBKEYHASH2;
+		h3 = SGX_INTEL_DEFAULT_LEPUBKEYHASH3;
+	}
+	else {
+		rdmsrl(MSR_IA32_SGXLEPUBKEYHASH0, h0);
+		rdmsrl(MSR_IA32_SGXLEPUBKEYHASH1, h1);
+		rdmsrl(MSR_IA32_SGXLEPUBKEYHASH2, h2);
+		rdmsrl(MSR_IA32_SGXLEPUBKEYHASH3, h3);
+	}
+
+	to_vmx(vcpu)->msr_ia32_sgxlepubkeyhash[0] = h0;
+	to_vmx(vcpu)->msr_ia32_sgxlepubkeyhash[1] = h1;
+	to_vmx(vcpu)->msr_ia32_sgxlepubkeyhash[2] = h2;
+	to_vmx(vcpu)->msr_ia32_sgxlepubkeyhash[3] = h3;
+}
+
+static void vmx_sgx_lepubkeyhash_load(struct kvm_vcpu *vcpu)
+{
+	wrmsrl(MSR_IA32_SGXLEPUBKEYHASH0,
+			to_vmx(vcpu)->msr_ia32_sgxlepubkeyhash[0]);
+	wrmsrl(MSR_IA32_SGXLEPUBKEYHASH1,
+			to_vmx(vcpu)->msr_ia32_sgxlepubkeyhash[1]);
+	wrmsrl(MSR_IA32_SGXLEPUBKEYHASH2,
+			to_vmx(vcpu)->msr_ia32_sgxlepubkeyhash[2]);
+	wrmsrl(MSR_IA32_SGXLEPUBKEYHASH3,
+			to_vmx(vcpu)->msr_ia32_sgxlepubkeyhash[3]);
+}
+
 /*
  * Switches to specified vcpu, until a matching vcpu_put(), but assumes
  * vcpu mutex is already taken.
@@ -2316,6 +2383,14 @@ static void vmx_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
 
 	vmx_vcpu_pi_load(vcpu, cpu);
 	vmx->host_pkru = read_pkru();
+
+	/*
+	 * Load guset's SGX LE pubkey hash if runtime launch control is
+	 * enabled.
+	 */
+	if (guest_cpuid_has_sgx_launch_control(vcpu) &&
+			cpu_sgx_lepubkeyhash_writable())
+		vmx_sgx_lepubkeyhash_load(vcpu);
 }
 
 static void vmx_vcpu_pi_put(struct kvm_vcpu *vcpu)
@@ -3225,6 +3300,19 @@ static int vmx_get_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 	case MSR_IA32_FEATURE_CONTROL:
 		msr_info->data = to_vmx(vcpu)->msr_ia32_feature_control;
 		break;
+	case MSR_IA32_SGXLEPUBKEYHASH0 ... MSR_IA32_SGXLEPUBKEYHASH3:
+		/*
+		 * SDM 35.1 Model-Specific Registers, table 35-2.
+		 * Read permitted if CPUID.0x12.0:EAX[0] = 1. (We have
+		 * guaranteed this will be true if guest_cpuid_has_sgx
+		 * is true.)
+		 */
+		if (!guest_cpuid_has_sgx(vcpu))
+			return 1;
+		msr_info->data =
+			to_vmx(vcpu)->msr_ia32_sgxlepubkeyhash[msr_info->index -
+			MSR_IA32_SGXLEPUBKEYHASH0];
+		break;
 	case MSR_IA32_VMX_BASIC ... MSR_IA32_VMX_VMFUNC:
 		if (!nested_vmx_allowed(vcpu))
 			return 1;
@@ -3343,6 +3431,37 @@ static int vmx_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 		 * nothing here. We assume guest will always check whether
 		 * SGX has been enabled in BIOS before using SGX.
 		 */
+		break;
+	case MSR_IA32_SGXLEPUBKEYHASH0 ... MSR_IA32_SGXLEPUBKEYHASH3:
+		/*
+		 * SDM 35.1 Model-Specific Registers, table 35-2.
+		 * - If CPUID.0x7.0:ECX[30] = 1, FEATURE_CONTROL[17] is
+		 * available.
+		 * - Write permitted if CPUID.0x12.0:EAX[0] = 1 &&
+		 * FEATURE_CONTROL[17] = 1 && FEATURE_CONTROL[0] = 1.
+		 */
+		if (!guest_cpuid_has_sgx(vcpu) ||
+				!guest_cpuid_has_sgx_launch_control(vcpu))
+			return 1;
+		/*
+		 * Don't let userspace set guest's IA32_SGXLEPUBKEYHASHn,
+		 * if machine's IA32_SGXLEPUBKEYHASHn cannot be changed at
+		 * runtime. Note to_vmx(vcpu)->msr_ia32_sgxlepubkeyhash are
+		 * set to default in vmx_create_vcpu therefore guest is able
+		 * to get the machine's IA32_SGXLEPUBKEYHASHn by rdmsr in
+		 * guest.
+		 */
+		if (!cpu_sgx_lepubkeyhash_writable())
+			return 1;
+		/*
+		 * If guest's FEATURE_CONTROL[17] is not set, guest's
+		 * IA32_SGXLEPUBKEYHASHn are not writeable from guest.
+		 */
+		if (!vmx_sgx_lc_disabled_in_bios(vcpu) &&
+				!msr_info->host_initiated)
+			return 1;
+		to_vmx(vcpu)->msr_ia32_sgxlepubkeyhash[msr_index -
+			MSR_IA32_SGXLEPUBKEYHASH0] = data;
 		break;
 	case MSR_IA32_VMX_BASIC ... MSR_IA32_VMX_VMFUNC:
 		if (!msr_info->host_initiated)
@@ -9304,6 +9423,10 @@ static struct kvm_vcpu *vmx_create_vcpu(struct kvm *kvm, unsigned int id)
 		nested_vmx_setup_ctls_msrs(vmx);
 		vmx->nested.vpid02 = allocate_vpid();
 	}
+
+	/* Set vcpu's default IA32_SGXLEPUBKEYHASHn */
+	if (enable_sgx && boot_cpu_has(X86_FEATURE_SGX_LAUNCH_CONTROL))
+		vmx_sgx_init_lepubkeyhash(&vmx->vcpu);
 
 	vmx->nested.posted_intr_nv = -1;
 	vmx->nested.current_vmptr = -1ull;
