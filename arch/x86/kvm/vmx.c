@@ -254,6 +254,7 @@ struct __packed vmcs12 {
 	u64 eoi_exit_bitmap2;
 	u64 eoi_exit_bitmap3;
 	u64 xss_exit_bitmap;
+	u64 encls_exiting_bitmap;
 	u64 guest_physical_address;
 	u64 vmcs_link_pointer;
 	u64 guest_ia32_debugctl;
@@ -780,6 +781,7 @@ static const unsigned short vmcs_field_to_offset_table[] = {
 	FIELD64(EOI_EXIT_BITMAP2, eoi_exit_bitmap2),
 	FIELD64(EOI_EXIT_BITMAP3, eoi_exit_bitmap3),
 	FIELD64(XSS_EXIT_BITMAP, xss_exit_bitmap),
+	FIELD64(ENCLS_EXITING_BITMAP, encls_exiting_bitmap),
 	FIELD64(GUEST_PHYSICAL_ADDRESS, guest_physical_address),
 	FIELD64(VMCS_LINK_POINTER, vmcs_link_pointer),
 	FIELD64(GUEST_IA32_DEBUGCTL, guest_ia32_debugctl),
@@ -1400,6 +1402,11 @@ static inline bool nested_cpu_has_vid(struct vmcs12 *vmcs12)
 static inline bool nested_cpu_has_posted_intr(struct vmcs12 *vmcs12)
 {
 	return vmcs12->pin_based_vm_exec_control & PIN_BASED_POSTED_INTR;
+}
+
+static inline bool nested_cpu_has_encls_exit(struct vmcs12 *vmcs12)
+{
+	return nested_cpu_has2(vmcs12, SECONDARY_EXEC_ENCLS_EXITING);
 }
 
 static inline bool is_nmi(u32 intr_info)
@@ -2309,6 +2316,128 @@ static void vmx_sgx_lepubkeyhash_load(struct kvm_vcpu *vcpu)
 			to_vmx(vcpu)->msr_ia32_sgxlepubkeyhash[2]);
 	wrmsrl(MSR_IA32_SGXLEPUBKEYHASH3,
 			to_vmx(vcpu)->msr_ia32_sgxlepubkeyhash[3]);
+}
+
+/*
+ * Setup ENCLS VMEXIT on current VMCS according to encls_vmexit_bitmap.
+ * If encls_vmexit_bitmap is 0, we also disable ENCLS VMEXIT in secondary
+ * execution control. Otherwise we enable ENCLS VMEXIT.
+ *
+ * Must be called after vcpu is loaded.
+ */
+static void vmx_set_encls_vmexit_bitmap(struct kvm_vcpu *vcpu, u64
+		encls_vmexit_bitmap)
+{
+	u32 secondary_exec_ctl = vmcs_read32(SECONDARY_VM_EXEC_CONTROL);
+
+	if (encls_vmexit_bitmap)
+		secondary_exec_ctl |= SECONDARY_EXEC_ENCLS_EXITING;
+	else
+		secondary_exec_ctl &= ~SECONDARY_EXEC_ENCLS_EXITING;
+
+	vmcs_write64(ENCLS_EXITING_BITMAP, encls_vmexit_bitmap);
+	vmcs_write32(SECONDARY_VM_EXEC_CONTROL, secondary_exec_ctl);
+}
+
+static void vmx_enable_encls_vmexit_all(struct kvm_vcpu *vcpu)
+{
+	vmx_set_encls_vmexit_bitmap(vcpu, -1ULL);
+}
+
+/* Disable ENCLS VMEXIT on current VMCS. Must be called after vcpu is loaded. */
+static void vmx_disable_encls_vmexit(struct kvm_vcpu *vcpu)
+{
+	vmx_set_encls_vmexit_bitmap(vcpu, 0);
+}
+
+static bool vmx_sgx_enabled_in_bios(struct kvm_vcpu *vcpu)
+{
+	u32 sgx_opted_in = FEATURE_CONTROL_SGX_ENABLE | FEATURE_CONTROL_LOCKED;
+
+	return (to_vmx(vcpu)->msr_ia32_feature_control & sgx_opted_in) ==
+		sgx_opted_in;
+}
+
+static void vmx_update_encls_vmexit(struct kvm_vcpu *vcpu)
+{
+	/* Hardware doesn't support SGX */
+	if (!cpu_has_vmx_encls_vmexit())
+		return;
+
+	/*
+	 * ENCLS error check sequence:
+	 *
+	 * 1) IF CR0.PE = 0 (real mode), or RFLAGS.VM = 1 (virtual-8086 mode),
+	 *    or SMM mode, or CPUID.0x12.0x0:EAX.SGX1 = 0
+	 *	#UD
+	 *
+	 * 2) IF CPL > 0
+	 *	#UD
+	 *
+	 * 3) VMEXIT if enabled
+	 *
+	 * 4) IA32_FEATURE_CONTROL.LOCK, or IA32_FEATURE_CONTROL.SGX_ENABLE = 0
+	 *	#GP
+	 *
+	 * 5) IF RAX = invalid leaf function
+	 *	#GP
+	 *
+	 * 6) IF CR0.PG = 0 (paging disabled)
+	 *	#GP
+	 *
+	 * 7) IF not in 64-bit mode, and DS.type is expend-down data
+	 *	#GP
+	 *
+	 *    Note: non 64-bit mode (32-bit mode) means:
+	 *	- protected mode
+	 *	- IA32e mode's compatibility mode (IA32_EFER.LMA = 1, CS.L = 1)
+	 *
+	 *    Currently KVM doesn't do anything in terms of compatibility mode
+	 *    (SECONDARY_VM_EXEC_CONTROL[bit 2] (descriptor-table exiting) is not
+	 *    enabled, so KVM won't trap any segment register operation in
+	 *    guest). We don't have to trap ENCLS for compatibility mode as
+	 *    ENCLS will behavior just the same in guest.
+	 *
+	 * So, to correctly emulate ENCLS, below ENCLS VMEXIT policy is applied:
+	 *
+	 * - For 1), in real mode, SMM mode, no need to trap ENCLS (we cannot
+	 *   actually, as this check happens before VMEXIT).
+	 *
+	 * - If SGX is not exposed to guest (guest_cpuid_has_sgx(vcpu) == 0), or
+	 *   SGX is not enabled in guest's BIOS (vmx->msr_ia32_feature_control
+	 *   doesn't have SGX_ENABLE or LOCK bit set), we need to turn on ENCLS
+	 *   VMEXIT for protect mode and long mode. The reason is, we need to
+	 *   inject #UD for the formar and inject #GP for the latter. The
+	 *   hardware actually has SGX support and it is indeed enabled in
+	 *   physical BIOS, so may be ENCLS will have different behavior with
+	 *   SDM when running in guest.
+	 *
+	 * - For 5), 6), 7), no need to trap ENCLS, as ENCLS will just cause
+	 *   #GP while running in guest.
+	 *
+	 * Most importantly:
+	 *
+	 * - If guest supports SGX, and SGX is enabled in guest's BIOS, on the
+	 *   contrary we don't want to turn on ENCLS VMEXIT, as ENCLS can
+	 *   perfectly run in guest while having the same hardware behavior.
+	 *   Trapping ENCLS from guest is meaningless but only hurt performance.
+	 */
+
+	/* It's pointless to update ENCLS VMEXIT while guest in real mode */
+	if (to_vmx(vcpu)->rmode.vm86_active)
+		return;
+
+	if (!guest_cpuid_has_sgx(vcpu) || !vmx_sgx_enabled_in_bios(vcpu)) {
+		vmx_enable_encls_vmexit_all(vcpu);
+		return;
+	}
+
+	/* If ENCLS VMEXIT is turned on nested, don't disable it */
+	if (nested && is_guest_mode(vcpu) &&
+			nested_cpu_has_encls_exit(get_vmcs12(vcpu)))
+		return;
+
+	vmx_disable_encls_vmexit(vcpu);
 }
 
 /*
@@ -3417,6 +3546,10 @@ static int vmx_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 		vmx->msr_ia32_feature_control = data;
 		if (msr_info->host_initiated && data == 0)
 			vmx_leave_nested(vcpu);
+
+		/* SGX may be enabled/disabled in guest's BIOS */
+		vmx_update_encls_vmexit(vcpu);
+
 		/*
 		 * If guest's FEATURE_CONTROL_SGX_ENABLE is disabled, shall
 		 * we also clear vcpu's SGX CPUID? SDM (chapter 37.7.7.1)
@@ -4131,6 +4264,9 @@ static void vmx_set_efer(struct kvm_vcpu *vcpu, u64 efer)
 		msr->data = efer & ~EFER_LME;
 	}
 	setup_msrs(vmx);
+
+	/* Possible mode change */
+	vmx_update_encls_vmexit(vcpu);
 }
 
 #ifdef CONFIG_X86_64
@@ -4337,6 +4473,9 @@ static void vmx_set_cr0(struct kvm_vcpu *vcpu, unsigned long cr0)
 
 	/* depends on vcpu->arch.cr0 to be set to a new value */
 	vmx->emulation_required = emulation_required(vcpu);
+
+	/* Possible mode change */
+	vmx_update_encls_vmexit(vcpu);
 }
 
 static u64 construct_eptp(unsigned long root_hpa)
@@ -4548,6 +4687,9 @@ static void vmx_set_segment(struct kvm_vcpu *vcpu,
 
 out:
 	vmx->emulation_required = emulation_required(vcpu);
+
+	/* Possible mode change */
+	vmx_update_encls_vmexit(vcpu);
 }
 
 static void vmx_get_cs_db_l_bits(struct kvm_vcpu *vcpu, int *db, int *l)
@@ -7992,6 +8134,73 @@ static int handle_preemption_timer(struct kvm_vcpu *vcpu)
 	return 1;
 }
 
+static int nested_handle_encls_exit(struct kvm_vcpu *vcpu)
+{
+	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
+
+	if (guest_cpuid_has_sgx(vcpu)) {
+		/*
+		 * Which means SGX is exposed to L1 but is disabled in
+		 * L1's BIOS. We should inject #GP according to SDM
+		 * (Chapter 37.7.1 Intel SGX Opt-in Configuration).
+		 *
+		 * nested_cpu_has_encls_exit cannot be true as in this
+		 * case we have allowed L1 to handle ENCLS VMEXIT.
+		 */
+		BUG_ON(nested_cpu_has_encls_exit(vmcs12));
+
+		kvm_inject_gp(vcpu, 0);
+	}
+	else {
+		/*
+		 * Which means we didn't expose SGX to L1 at all. Inject
+		 * #UD according to SDM.
+		 */
+		kvm_queue_exception(vcpu, UD_VECTOR);
+	}
+
+	return 1;
+}
+
+/*
+ * Handle ENCLS VMEXIT due to unexpected ENCLS from in guest, including
+ * executing ENCLS when SGX is not exposed to guest, or SGX is disabled
+ * in guest BIOS.
+ *
+ * Return 1 if handled, 0 if not handled
+ */
+static int handle_unexpected_encls(struct kvm_vcpu *vcpu)
+{
+	if (guest_cpuid_has_sgx(vcpu) && vmx_sgx_enabled_in_bios(vcpu))
+		return 0;
+
+	if (!guest_cpuid_has_sgx(vcpu))
+		kvm_queue_exception(vcpu, UD_VECTOR);
+	else	/* !vmx_sgx_enabled_in_bios(vcpu)) */
+		kvm_inject_gp(vcpu, 0);
+
+	kvm_x86_ops->skip_emulated_instruction(vcpu);
+
+	return 1;
+}
+
+static int handle_encls(struct kvm_vcpu *vcpu)
+{
+	/* Handle ENCLS VMEXIT from L2 */
+	if (is_guest_mode(vcpu))
+		return nested_handle_encls_exit(vcpu);
+
+	/*
+	 * Handle unexpected ENCLS VMEXIT. If successfully handled we can
+	 * just return to guest to run.
+	 */
+	if (handle_unexpected_encls(vcpu))
+		return 1;
+
+	/* So far ENCLS is not trapped in normal cases. */
+	return -EFAULT;
+}
+
 /*
  * The exit handlers return 1 if the exit was handled fully and guest execution
  * may resume.  Otherwise they set the kvm_run parameter to indicate what needs
@@ -8043,6 +8252,7 @@ static int (*const kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
 	[EXIT_REASON_XRSTORS]                 = handle_xrstors,
 	[EXIT_REASON_PML_FULL]		      = handle_pml_full,
 	[EXIT_REASON_PREEMPTION_TIMER]	      = handle_preemption_timer,
+	[EXIT_REASON_ENCLS]		      = handle_encls,
 };
 
 static const int kvm_vmx_max_exit_handlers =
@@ -8356,6 +8566,43 @@ static bool nested_vmx_exit_handled(struct kvm_vcpu *vcpu)
 	case EXIT_REASON_PML_FULL:
 		/* We don't expose PML support to L1. */
 		return false;
+	case EXIT_REASON_ENCLS:
+		/*
+		 * So far we don't trap ENCLS in normal case (meaning SGX is
+		 * exposed to guest and SGX is enabled in guest's BIOS).
+		 * If SGX is enabled in L1 hypervisor properly, L1 hypervisor
+		 * should take care of this ENCLS VMEXIT, otherwise L0
+		 * hypervisor should handle this ENCLS VMEXIT and inject proper
+		 * error (#UD or #GP) according to ENCLS behavior in abnormal
+		 * SGX environment.
+		 */
+		if (guest_cpuid_has_sgx(vcpu) &&
+				vmx_sgx_enabled_in_bios(vcpu)) {
+			/*
+			 * As explained above, if SGX in L1 hypervisor is
+			 * normal, ENCLS VMEXIT from L2 guest should be due
+			 * to L1 turned on ENCLS VMEXIT, as L0 won't turn on
+			 * ENCLS VMEXIT in this case. We don't want to handle
+			 * this case in L0 as we really don't know how to,
+			 * and instead, we depend on L1 hypervisor to handle.
+			 */
+			WARN_ON(!nested_cpu_has_encls_exit(vmcs12));
+			return true;
+		}
+		else if (guest_cpuid_has_sgx(vcpu)) {
+			/*
+			 * If SGX is exposed to L1 but SGX is not turned on
+			 * in L1's BIOS, then L1 may or may not turn on ENCLS
+			 * VMEXIT. If ENCLS VMEXIT is turned on in L1, VMEXIT
+			 * happens prior to FEATURE_CONTROL check, so we inject
+			 * ENCLS VMEXIT to L1. Otherwise we let L0 inject #GP
+			 * directly to L2.
+			 */
+			return nested_cpu_has_encls_exit(vmcs12);
+		}
+		else {
+			return false;
+		}
 	default:
 		return true;
 	}
@@ -9743,7 +9990,18 @@ static int vmx_cpuid_update(struct kvm_vcpu *vcpu)
 		if (guest_cpuid_has_sgx_launch_control(vcpu))
 			to_vmx(vcpu)->msr_ia32_feature_control_valid_bits |=
 				FEATURE_CONTROL_SGX_LAUNCH_CONTROL_ENABLE;
+
+		/*
+		 * To reflect hardware hebavior, We must allow guest to be able
+		 * to set ENCLS exiting if we expose SGX to guest.
+		 */
+		if (nested_vmx_allowed(vcpu))
+			to_vmx(vcpu)->nested.nested_vmx_secondary_ctls_high |=
+				SECONDARY_EXEC_ENCLS_EXITING;
 	}
+
+	/* SGX CPUID may be changed */
+	vmx_update_encls_vmexit(vcpu);
 
 	return 0;
 }
@@ -10490,6 +10748,13 @@ static int prepare_vmcs02(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12,
 		 */
 		if (exec_control & SECONDARY_EXEC_VIRTUALIZE_APIC_ACCESSES)
 			vmcs_write64(APIC_ACCESS_ADDR, -1ull);
+
+		/* If L1 has turned on ENCLS vmexit, we need to honor that. */
+		if (nested_cpu_has_encls_exit(vmcs12)) {
+			exec_control |= SECONDARY_EXEC_ENCLS_EXITING;
+			vmcs_write64(ENCLS_EXITING_BITMAP,
+					vmcs12->encls_exiting_bitmap);
+		}
 
 		vmcs_write32(SECONDARY_VM_EXEC_CONTROL, exec_control);
 	}
